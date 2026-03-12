@@ -1,0 +1,21 @@
+{
+  "scenario": "minimal",
+  "timestamp": "2026-03-11T10:51:58.523782",
+  "total_requests": 100000,
+  "success_count": 100000,
+  "failure_count": 0,
+  "success_rate_pct": 100.0,
+  "total_duration_sec": 478.30195051400005,
+  "throughput_req_per_sec": 209.0729504501006,
+  "latency_ms": {
+    "min": 2.2702329997628112,
+    "max": 46.1287900006937,
+    "p50": 4.539010499684082,
+    "p95": 6.273088249645294,
+    "p99": 8.166204260769511
+  },
+  "status_codes": {
+    "201": 100000
+  },
+  "error_categories": {}
+}

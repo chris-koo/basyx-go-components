@@ -1,0 +1,54 @@
+services:
+  db_bench:
+    image: postgres:18
+    container_name: postgres_db_bench
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: basyxBenchDB
+    command: ["postgres", "-c", "listen_addresses=*"]
+    ports:
+      - "6532:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d basyxBenchDB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  aas_repository_bench:
+    build:
+      context: ../../../..
+      dockerfile: ./cmd/aasrepositoryservice/Dockerfile
+    environment:
+      - SERVER_PORT=5004
+      - POSTGRES_HOST=db_bench
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin123
+      - POSTGRES_DBNAME=basyxBenchDB
+      - POSTGRES_MAXOPENCONNECTIONS=500
+      - POSTGRES_MAXIDLECONNECTIONS=500
+      - POSTGRES_CONNMAXLIFETIMEMINUTES=5
+      - SERVER_STRICTVERIFICATION=false
+    ports:
+      - "6104:5004"
+    depends_on:
+      db_bench:
+        condition: service_healthy
+
+  aas_repository_benchmark_runner:
+    profiles: ["benchmark"]
+    build:
+      context: ../../../..
+      dockerfile: ./internal/aasrepository/benchmark_results/Dockerfile
+    environment:
+      - BENCH_TOTAL_POSTS=${BENCH_TOTAL_POSTS:-100000}
+      - BENCH_PROGRESS_EVERY=${BENCH_PROGRESS_EVERY:-5000}
+      - BENCH_SCENARIOS=${BENCH_SCENARIOS:-minimal}
+      - BENCH_TARGET_URL=http://aas_repository_bench:5004/shells
+    command: ["--manage-compose", "false"]
+    volumes:
+      - ../results:/workspace/internal/aasrepository/benchmark_results/results
+    depends_on:
+      aas_repository_bench:
+        condition: service_started
