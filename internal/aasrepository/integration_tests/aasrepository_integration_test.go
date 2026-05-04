@@ -237,6 +237,32 @@ func getJSONResponse(endpoint string) (map[string]any, int, error) {
 	return payload, resp.StatusCode, nil
 }
 
+func getJSONArrayResponse(endpoint string) ([]string, int, error) {
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to send request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to read response: %v", err)
+	}
+
+	var payload []string
+	if err = json.Unmarshal(body, &payload); err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to unmarshal response: %v", err)
+	}
+
+	return payload, resp.StatusCode, nil
+}
+
 func putJSONResponse(endpoint string, body string) (map[string]any, int, http.Header, error) {
 	req, err := http.NewRequest(http.MethodPut, endpoint, strings.NewReader(body))
 	if err != nil {
@@ -369,6 +395,88 @@ func setExternalThumbnailForAAS(aasID string, externalURL string) error {
 	}
 
 	return nil
+}
+
+func getAASDatabaseID(db *sql.DB, aasID string) (int64, error) {
+	dialect := goqu.Dialect("postgres")
+	selectAASDBIDSQL, selectAASDBIDArgs, selectAASDBIDBuildErr := dialect.
+		From(goqu.T("aas")).
+		Select(goqu.I("id")).
+		Where(goqu.I("aas_id").Eq(aasID)).
+		Limit(1).
+		ToSQL()
+	if selectAASDBIDBuildErr != nil {
+		return 0, fmt.Errorf("failed to build aas id query: %v", selectAASDBIDBuildErr)
+	}
+
+	var aasDBID int64
+	if queryErr := db.QueryRow(selectAASDBIDSQL, selectAASDBIDArgs...).Scan(&aasDBID); queryErr != nil {
+		return 0, fmt.Errorf("failed to query aas db id: %v", queryErr)
+	}
+
+	return aasDBID, nil
+}
+
+func sqlLiteral(input string) string {
+	return strings.ReplaceAll(input, "'", "''")
+}
+
+func installDeleteFailureTriggers(t *testing.T, db *sql.DB, aasDBID int64, submodelID string) {
+	t.Helper()
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	deleteFunctionName := fmt.Sprintf("it_fail_submodel_delete_fn_%s", suffix)
+	deleteTriggerName := fmt.Sprintf("it_fail_submodel_delete_trg_%s", suffix)
+	restoreFunctionName := fmt.Sprintf("it_fail_submodel_ref_restore_fn_%s", suffix)
+	restoreTriggerName := fmt.Sprintf("it_fail_submodel_ref_restore_trg_%s", suffix)
+	safeSubmodelID := sqlLiteral(submodelID)
+
+	createDeleteFunctionSQL := fmt.Sprintf(`
+CREATE FUNCTION %s() RETURNS trigger AS $$
+BEGIN
+  IF OLD.submodel_identifier = '%s' THEN
+    RAISE EXCEPTION 'forced submodel delete failure';
+  END IF;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;`, deleteFunctionName, safeSubmodelID)
+	_, err := db.Exec(createDeleteFunctionSQL)
+	require.NoError(t, err, "failed to create delete failure trigger function")
+
+	createDeleteTriggerSQL := fmt.Sprintf(`
+CREATE TRIGGER %s
+BEFORE DELETE ON submodel
+FOR EACH ROW
+EXECUTE FUNCTION %s();`, deleteTriggerName, deleteFunctionName)
+	_, err = db.Exec(createDeleteTriggerSQL)
+	require.NoError(t, err, "failed to create delete failure trigger")
+
+	createRestoreFunctionSQL := fmt.Sprintf(`
+CREATE FUNCTION %s() RETURNS trigger AS $$
+BEGIN
+  IF NEW.aas_id = %d THEN
+    RAISE EXCEPTION 'forced submodel reference restore failure';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;`, restoreFunctionName, aasDBID)
+	_, err = db.Exec(createRestoreFunctionSQL)
+	require.NoError(t, err, "failed to create reference restore failure trigger function")
+
+	createRestoreTriggerSQL := fmt.Sprintf(`
+CREATE TRIGGER %s
+BEFORE INSERT ON aas_submodel_reference
+FOR EACH ROW
+EXECUTE FUNCTION %s();`, restoreTriggerName, restoreFunctionName)
+	_, err = db.Exec(createRestoreTriggerSQL)
+	require.NoError(t, err, "failed to create reference restore failure trigger")
+
+	t.Cleanup(func() {
+		_, _ = db.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON aas_submodel_reference`, restoreTriggerName))
+		_, _ = db.Exec(fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, restoreFunctionName))
+		_, _ = db.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON submodel`, deleteTriggerName))
+		_, _ = db.Exec(fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, deleteFunctionName))
+	})
 }
 
 // IntegrationTest runs the integration tests based on the config file
@@ -508,6 +616,60 @@ func TestGetSubmodelByIdAasRepositoryReturnsSubmodel(t *testing.T) {
 	assert.Equal(t, "Submodel", payload["modelType"], "Expected submodel modelType in GET response")
 }
 
+func TestSubmodelSuperPathEndpointsAasRepository(t *testing.T) {
+	baseURL := "http://localhost:6004"
+	aasID := fmt.Sprintf("https://example.com/ids/aas/superpath-%d", time.Now().UnixNano())
+	aasIdentifier := base64.RawURLEncoding.EncodeToString([]byte(aasID))
+
+	statusCode, err := createAASForThumbnailTest(baseURL, aasID)
+	require.NoError(t, err, "AAS creation failed")
+	require.Equal(t, http.StatusCreated, statusCode, "Expected 201 Created for AAS creation")
+
+	submodelID := fmt.Sprintf("https://example.com/ids/sm/superpath-%d", time.Now().UnixNano())
+	submodelIdentifier := base64.RawURLEncoding.EncodeToString([]byte(submodelID))
+
+	submodelEndpoint := fmt.Sprintf("%s/shells/%s/submodels/%s", baseURL, aasIdentifier, submodelIdentifier)
+	body := fmt.Sprintf(
+		`{"id":"%s","idShort":"SuperpathSubmodel","modelType":"Submodel","kind":"Instance","submodelElements":[{"idShort":"TopProperty","modelType":"Property","valueType":"xs:string","value":"hello"},{"idShort":"MainCollection","modelType":"SubmodelElementCollection","value":[{"idShort":"NestedProperty","modelType":"Property","valueType":"xs:string","value":"nested"}]}]}`,
+		submodelID,
+	)
+
+	_, putStatusCode, _, putErr := putJSONResponse(submodelEndpoint, body)
+	require.NoError(t, putErr, "PUT submodel request failed")
+	require.Equal(t, http.StatusCreated, putStatusCode, "Expected 201 Created for PUT submodel")
+
+	t.Run("GetSubmodelByIdPathDeepReturnsNestedPaths", func(t *testing.T) {
+		paths, pathStatusCode, pathErr := getJSONArrayResponse(fmt.Sprintf("%s/$path?level=deep", submodelEndpoint))
+		require.NoError(t, pathErr, "GET submodel $path request failed")
+		require.Equal(t, http.StatusOK, pathStatusCode, "Expected 200 OK for GET submodel $path")
+
+		assert.Contains(t, paths, "TopProperty")
+		assert.Contains(t, paths, "MainCollection")
+		assert.Contains(t, paths, "MainCollection.NestedProperty")
+	})
+
+	t.Run("GetSubmodelElementByPathPathCoreReturnsRequestedPath", func(t *testing.T) {
+		paths, pathStatusCode, pathErr := getJSONArrayResponse(fmt.Sprintf("%s/submodel-elements/MainCollection/$path?level=core", submodelEndpoint))
+		require.NoError(t, pathErr, "GET submodel element $path request failed")
+		require.Equal(t, http.StatusOK, pathStatusCode, "Expected 200 OK for GET submodel element $path")
+
+		assert.Equal(t, []string{"MainCollection"}, paths)
+	})
+
+	t.Run("GetSubmodelByIdPathReturnsNotFoundIfSubmodelNotReferencedInAAS", func(t *testing.T) {
+		otherAASID := fmt.Sprintf("https://example.com/ids/aas/superpath-other-%d", time.Now().UnixNano())
+		otherAASIdentifier := base64.RawURLEncoding.EncodeToString([]byte(otherAASID))
+
+		createStatus, createErr := createAASForThumbnailTest(baseURL, otherAASID)
+		require.NoError(t, createErr, "Second AAS creation failed")
+		require.Equal(t, http.StatusCreated, createStatus, "Expected 201 Created for second AAS creation")
+
+		getStatusCode, getErr := getResponseStatus(fmt.Sprintf("%s/shells/%s/submodels/%s/$path?level=deep", baseURL, otherAASIdentifier, submodelIdentifier))
+		require.NoError(t, getErr, "GET submodel $path with unlinked AAS request failed")
+		require.Equal(t, http.StatusNotFound, getStatusCode, "Expected 404 for submodel not referenced in selected AAS")
+	})
+}
+
 func TestDeleteSubmodelByIdAasRepositoryDeletesSubmodelAndReference(t *testing.T) {
 	baseURL := "http://localhost:6004"
 	aasID := fmt.Sprintf("https://example.com/ids/aas/delete-submodel-%d", time.Now().UnixNano())
@@ -543,6 +705,51 @@ func TestDeleteSubmodelByIdAasRepositoryDeletesSubmodelAndReference(t *testing.T
 	getDeletedStatusCode, getDeletedErr := getResponseStatus(endpoint)
 	require.NoError(t, getDeletedErr, "GET deleted submodel request failed")
 	require.Equal(t, http.StatusNotFound, getDeletedStatusCode, "Expected 404 Not Found for deleted submodel")
+}
+
+func TestDeleteSubmodelByIdAasRepositoryRollsBackReferenceDeleteOnSubmodelDeleteFailure(t *testing.T) {
+	baseURL := "http://localhost:6004"
+	aasID := fmt.Sprintf("https://example.com/ids/aas/delete-submodel-tx-%d", time.Now().UnixNano())
+	aasIdentifier := base64.RawURLEncoding.EncodeToString([]byte(aasID))
+
+	statusCode, err := createAASForThumbnailTest(baseURL, aasID)
+	require.NoError(t, err, "AAS creation failed")
+	require.Equal(t, http.StatusCreated, statusCode, "Expected 201 Created for AAS creation")
+
+	submodelID := fmt.Sprintf("https://example.com/ids/sm/delete-submodel-tx-%d", time.Now().UnixNano())
+	submodelIdentifier := base64.RawURLEncoding.EncodeToString([]byte(submodelID))
+	endpoint := fmt.Sprintf("%s/shells/%s/submodels/%s", baseURL, aasIdentifier, submodelIdentifier)
+
+	body := fmt.Sprintf(
+		`{"id":"%s","idShort":"DeleteSubmodelTx","modelType":"Submodel","kind":"Instance","submodelElements":[{"idShort":"prop1","modelType":"Property","valueType":"xs:string","value":"hello"}]}`,
+		submodelID,
+	)
+	_, putStatusCode, _, putErr := putJSONResponse(endpoint, body)
+	require.NoError(t, putErr, "PUT submodel request failed")
+	require.Equal(t, http.StatusCreated, putStatusCode, "Expected 201 Created when creating submodel via AAS endpoint")
+
+	db, openErr := sql.Open("postgres", integrationTestDSN)
+	require.NoError(t, openErr, "failed to open db connection")
+	t.Cleanup(func() { _ = db.Close() })
+
+	aasDBID, aasDBIDErr := getAASDatabaseID(db, aasID)
+	require.NoError(t, aasDBIDErr, "failed to resolve aas db id")
+	installDeleteFailureTriggers(t, db, aasDBID, submodelID)
+
+	deleteStatusCode, deleteErr := deleteResponseStatus(endpoint)
+	require.NoError(t, deleteErr, "DELETE submodel request failed")
+	require.Equal(t, http.StatusInternalServerError, deleteStatusCode, "Expected 500 when submodel delete is forced to fail")
+
+	referencesPayload, referencesStatusCode, referencesErr := getJSONResponse(fmt.Sprintf("%s/shells/%s/submodel-refs", baseURL, aasIdentifier))
+	require.NoError(t, referencesErr, "GET submodel references failed")
+	require.Equal(t, http.StatusOK, referencesStatusCode, "Expected 200 OK for GET submodel references")
+	result, ok := referencesPayload["result"].([]any)
+	require.True(t, ok, "Expected result array in submodel references response")
+	require.Len(t, result, 1, "Expected submodel reference to be restored by transaction rollback")
+
+	getExistingStatusCode, getExistingErr := getResponseStatus(endpoint)
+	require.NoError(t, getExistingErr, "GET submodel request failed")
+	require.Equal(t, http.StatusOK, getExistingStatusCode, "Expected submodel to remain when delete transaction fails")
 }
 
 func TestThumbnailAttachmentOperations(t *testing.T) {
